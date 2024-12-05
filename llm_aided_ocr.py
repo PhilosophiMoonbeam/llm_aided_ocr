@@ -154,14 +154,19 @@ def load_model(llm_model_name: str, raise_exception: bool = True):
 
 # API Interaction Functions
 async def generate_completion(prompt: str, max_tokens: int = 5000) -> Optional[str]:
+    """
+    Generate a text completion using the specified API or local LLM.
+    Handles invalid API_PROVIDER and missing configurations with graceful error logging.
+    """
     if USE_LOCAL_LLM:
         return await generate_completion_from_local_llm(DEFAULT_LOCAL_MODEL_NAME, prompt, max_tokens)
-    elif API_PROVIDER == "CLAUDE":
+    elif API_PROVIDER.upper() == "CLAUDE":  # Use "CLAUDE" for Anthropic's API explicitly
         return await generate_completion_from_claude(prompt, max_tokens)
-    elif API_PROVIDER == "OPENAI":
+    elif API_PROVIDER.upper() == "OPENAI":  # Use "OPENAI" explicitly for OpenAI API
         return await generate_completion_from_openai(prompt, max_tokens)
     else:
-        logging.error(f"Invalid API_PROVIDER: {API_PROVIDER}")
+        # Handle invalid API_PROVIDER gracefully by logging an error
+        logging.error(f"Invalid API_PROVIDER: '{API_PROVIDER}'. Only 'OPENAI', 'CLAUDE', or Local LLM are supported.")
         return None
 
 def get_tokenizer(model_name: str):
@@ -623,6 +628,11 @@ async def main():
     try:
         # Suppress HTTP request logs
         logging.getLogger("httpx").setLevel(logging.WARNING)
+        
+        # Validate API_PROVIDER before proceeding
+        if not USE_LOCAL_LLM and API_PROVIDER.upper() not in {"OPENAI", "CLAUDE"}:
+            raise ValueError(f"Unsupported API_PROVIDER: '{API_PROVIDER}'. Check your configuration.")
+        
         input_pdf_file_path = '160301289-Warren-Buffett-Katharine-Graham-Letter.pdf'
         max_test_pages = 0
         skip_first_n_pages = 0
@@ -637,44 +647,51 @@ async def main():
         else:
             logging.info(f"Using API for completions: {API_PROVIDER}")
             logging.info(f"Using OpenAI model for embeddings: {OPENAI_EMBEDDING_MODEL}")
-
+        
         base_name = os.path.splitext(input_pdf_file_path)[0]
         output_extension = '.md' if reformat_as_markdown else '.txt'
-        
         raw_ocr_output_file_path = f"{base_name}__raw_ocr_output.txt"
         llm_corrected_output_file_path = base_name + '_llm_corrected' + output_extension
-
+        
+        # Step 1: Convert PDF to images and perform OCR
         list_of_scanned_images = convert_pdf_to_images(input_pdf_file_path, max_test_pages, skip_first_n_pages)
         logging.info(f"Tesseract version: {pytesseract.get_tesseract_version()}")
         logging.info("Extracting text from converted pages...")
         with ThreadPoolExecutor() as executor:
             list_of_extracted_text_strings = list(executor.map(ocr_image, list_of_scanned_images))
         logging.info("Done extracting text from converted pages.")
+        
+        # Step 2: Save Raw OCR output for reference
         raw_ocr_output = "\n".join(list_of_extracted_text_strings)
         with open(raw_ocr_output_file_path, "w") as f:
             f.write(raw_ocr_output)
         logging.info(f"Raw OCR output written to: {raw_ocr_output_file_path}")
-
+        
+        # Step 3: Process Document
         logging.info("Processing document...")
-        final_text = await process_document(list_of_extracted_text_strings, reformat_as_markdown, suppress_headers_and_page_numbers)            
+        final_text = await process_document(list_of_extracted_text_strings, reformat_as_markdown, suppress_headers_and_page_numbers)
+        
+        # Check if processing succeeded
+        if not final_text:
+            logging.warning("Processing resulted in an empty or invalid document.")
+            raise RuntimeError("Document processing failed. No output generated.")
+
         cleaned_text = remove_corrected_text_header(final_text)
         
-        # Save the LLM corrected output
+        # Step 4: Save Corrected Output
         with open(llm_corrected_output_file_path, 'w') as f:
             f.write(cleaned_text)
         logging.info(f"LLM Corrected text written to: {llm_corrected_output_file_path}") 
-
+        
+        # Logging the first 500 characters of the processed file
         if final_text:
             logging.info(f"First 500 characters of LLM corrected processed text:\n{final_text[:500]}...")
-        else:
-            logging.warning("final_text is empty or not defined.")
-
         logging.info(f"Done processing {input_pdf_file_path}.")
         logging.info("\nSee output files:")
         logging.info(f" Raw OCR: {raw_ocr_output_file_path}")
         logging.info(f" LLM Corrected: {llm_corrected_output_file_path}")
-
-        # Perform a final quality check
+        
+        # Step 5: Quality Assessment
         quality_score, explanation = await assess_output_quality(raw_ocr_output, final_text)
         if quality_score is not None:
             logging.info(f"Final quality score: {quality_score}/100")
